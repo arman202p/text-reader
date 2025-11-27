@@ -1,31 +1,54 @@
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from pathlib import Path
 from PIL import Image
 import pytesseract
 from gtts import gTTS
-from deep_translator import GoogleTranslator
-import tempfile
 import os
 from dotenv import load_dotenv
+from fastapi.responses import Response
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+import tempfile
+from pathlib import Path
+import platform
+from deep_translator import GoogleTranslator
+from fastapi import Form
+from fastapi.responses import JSONResponse
 
-# Load .env
-load_dotenv()
+load_dotenv()  # loads variables from .env file
+
 PORT = int(os.getenv("PORT", 10000))
 
-# Base paths
-BASE_DIR = Path(__file__).parent
-FRONTEND_DIR = BASE_DIR / "frontend"
-AUDIO_DIR = FRONTEND_DIR / "audio"
-AUDIO_DIR.mkdir(parents=True, exist_ok=True)  # Ensure audio folder exists
 
-# Tesseract paths (Linux/Railway)
-pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-TESSDATA_PATH = "/usr/share/tesseract-ocr/tessdata"
+if platform.system() == "Windows":
+    tesseract_path = os.getenv("TESSERACT_PATH", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+    tessdata_dir_path = os.getenv("TESSERACT_LANG_DATA_PATH", r"C:\Program Files\Tesseract-OCR\tessdata")
+else:
+    tesseract_path = os.getenv("TESSERACT_PATH", "/usr/bin/tesseract")
+    tessdata_dir_path = os.getenv("TESSERACT_LANG_DATA_PATH", "/usr/share/tesseract-ocr/tessdata")
+print("Running on:", platform.system())
+print("Tesseract path:", tesseract_path)
+print("Tessdata path:", tessdata_dir_path)
 
-# Language map
+#pytesseract.pytesseract.TesseractNotFoundError: tesseract is not installed or it's not in your path
+pytesseract.pytesseract.tesseract_cmd = tesseract_path
+custom_config = f'--tessdata-dir "{tessdata_dir_path}"' if tessdata_dir_path else ""
+
+app = FastAPI()
+
+app.mount("/static", StaticFiles(directory=Path(__file__).parent / "frontend", html=True), name="frontend")
+# Allow frontend to access backend from browser
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[os.getenv("FRONTEND_URL") or "*"],  # In production, specify your frontend domain instead of "*"
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# Path to the frontend index.html
+frontend_index = Path(__file__).parent / "frontend" / "index.html"
+
 LANG_CODE_MAP = {
     'eng': 'en',
     'spa': 'es',
@@ -40,114 +63,105 @@ LANG_CODE_MAP = {
     'hin': 'hi'
 }
 
-# FastAPI app
-app = FastAPI()
-
-# CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Static route for frontend
-app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
-
-@app.get("/health")
-def health_check():
-    """Health check endpoint for Railway."""
-    return {
-        "status": "healthy",
-        "tesseract_path": pytesseract.pytesseract.tesseract_cmd,
-        "tessdata_path": TESSDATA_PATH,
-        "frontend_dir": str(FRONTEND_DIR),
-        "audio_dir": str(AUDIO_DIR)
-    }
-
 @app.get("/", response_class=HTMLResponse)
 def home():
-    """Serve the frontend."""
-    index_path = FRONTEND_DIR / "index.html"
-    if not index_path.exists():
-        return HTMLResponse(
-            content=f"<h1>Frontend not found</h1><p>Looking for: {index_path}</p><p>BASE_DIR: {BASE_DIR}</p>",
-            status_code=404
-        )
-    return FileResponse(index_path)
+    return FileResponse(frontend_index)
+
+# Serve a default favicon (16x16 blank icon)
+@app.get("/favicon.ico")
+async def favicon():
+    # A tiny transparent 16x16 favicon in bytes
+    favicon_bytes = bytes.fromhex(
+        "00000100010010100000010010000000000100000001000000000000000000000000000000"
+    )
+    return Response(content=favicon_bytes, media_type="image/x-icon")
 
 @app.post("/ocr-tts/")
 async def ocr_tts(
     file: UploadFile = File(...),
-    source_lang: str = Form("eng"),
-    target_lang: str = Form("en"),
-    translate: str = Form("false")
+    source_lang: str = Form("eng"),      #  NEW: Source language for OCR
+    target_lang: str = Form("en"),       #  NEW: Target language for TTS
+    translate: str = Form("false")       #  NEW: Whether to translate
 ):
-    temp_img_path = None
+
     try:
+        print("=" * 50)
+        print("Source language (OCR):", source_lang)
+        print("Target language (TTS):", target_lang)
+        print("Translation needed:", translate)
+        # Debug: Print paths
+        print("Tesseract path:", pytesseract.pytesseract.tesseract_cmd)
+        print("Tessdata dir path:", tessdata_dir_path)
+        print("Uploaded file:", file.filename)
+
         # Read uploaded image
         contents = await file.read()
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp.write(contents)
-            temp_img_path = tmp.name
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_img:
+            tmp_img.write(contents)
+            temp_file = tmp_img.name
+        print("Temporary image path:", temp_file)
+
+        # Open image and run OCR
+        img = Image.open(temp_file)
+        text = pytesseract.image_to_string(img, lang=source_lang, config=f'--tessdata-dir "{tessdata_dir_path}"')
+        print("OCR extracted text:", repr(text))  # Debug: show exactly what was extracted
+        print("OCR extracted text:", repr(text))
+
+        if not text.strip():
+            return JSONResponse({"error": "No text found in image!"}, status_code=400)
         
-        # OCR
-        img = Image.open(temp_img_path)
-        text = pytesseract.image_to_string(
-            img,
-            lang=source_lang,
-            config=f'--tessdata-dir "{TESSDATA_PATH}"'
-        )
-        extracted_text = text.strip()
-        
-        if not extracted_text:
-            return JSONResponse({"error": "No text detected in image!"}, status_code=400)
-        
-        final_text = extracted_text
         translated_text = None
-        
-        # Translation (optional)
-        if translate == "true":
+        final_text = text.strip()
+        source_iso = LANG_CODE_MAP.get(source_lang, source_lang)
+        if translate == "true" and source_iso != target_lang:
             try:
-                source_iso = LANG_CODE_MAP.get(source_lang, "en")
+                print(f"Translating from {source_iso} to {target_lang}...")
                 translator = GoogleTranslator(source=source_iso, target=target_lang)
-                translated_text = translator.translate(final_text)
+                translated_text = translator.translate(text.strip())
                 final_text = translated_text
+                print("Translated text:", repr(translated_text))
             except Exception as e:
-                print("Translation error:", e)
-                return JSONResponse({"error": f"Translation failed: {str(e)}"}, status_code=500)
+                print(f"Translation error: {e}")
+                # If translation fails, use original text
+                translated_text = None
         
-        # Generate TTS
-        audio_filename = f"audio_{os.path.basename(temp_img_path)}.mp3"
-        audio_path = AUDIO_DIR / audio_filename
-        tts = gTTS(final_text, lang=target_lang)
-        tts.save(audio_path)
+        audio_file = temp_file.replace(".png", ".mp3")
         
-        # Response
+        # Map target_lang to gTTS format if needed
+        gtts_lang = target_lang
+        if target_lang == 'zh':
+            gtts_lang = 'zh-cn'  # gTTS uses 'zh-cn' for Chinese
+        
+        tts = gTTS(text=final_text, lang=gtts_lang)
+        tts.save(audio_file)
+        print("Audio file created:", audio_file)
+
+        # 🆕 NEW: Return JSON response with all information
+        # Save audio to a static location so we can reference it
+        static_audio_dir = Path(__file__).parent / "frontend" / "audio"
+        static_audio_dir.mkdir(exist_ok=True)
+        
+        audio_filename = f"audio_{os.path.basename(audio_file)}"
+        static_audio_path = static_audio_dir / audio_filename
+        
+        # Copy audio to static directory
+        import shutil
+        shutil.copy(audio_file, static_audio_path)
+        
         response_data = {
-            "extracted_text": extracted_text,
-            "audio_url": f"/static/audio/{audio_filename}",
+            "extracted_text": text.strip(),
+            "audio_url": f"/static/audio/{audio_filename}"
         }
+        
+        # Only include translated_text if translation occurred
         if translated_text:
             response_data["translated_text"] = translated_text
         
+        print("Response data:", response_data)
         return JSONResponse(response_data)
-        
+
     except Exception as e:
-        print("Error:", e)
+        print("Error:", str(e))
         import traceback
         traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
-    
-    finally:
-        # Cleanup temporary file
-        if temp_img_path and os.path.exists(temp_img_path):
-            try:
-                os.unlink(temp_img_path)
-            except:
-                pass
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
